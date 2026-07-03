@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# push_tasks.sh — 推送当前待办清单给本人（私信）
-# 早上跑：先扫一遍最新的，再把所有未完成任务整理成清单推送
+# push_tasks.sh — 早间推送：今日日程 + 待办清单（私信）
+# 先扫最新消息入表 + 同步本周行程，再把「今日日程」和「未完成任务」整理成一条私信推给本人
 set -euo pipefail
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,12 +9,32 @@ export PATH="$HOME/.npm-global/bin:$PATH"
 
 lark-cli profile use "$LARK_PROFILE" >/dev/null 2>&1 || true
 
-# 先扫一遍最新消息（把昨晚到现在新 @我的 也纳入）
+# 1) 先扫一遍最新消息（把昨晚到现在新 @我的 也纳入）
 echo "[push] 先扫描最新消息..."
 bash "$SKILL_DIR/scripts/scan.sh" "$SCAN_DAYS" || echo "[push] 扫描出错，继续推送已有任务"
 
+# 2) 同步本周行程（append：新约的会加进行程表，不动已有行→保留你手动改的状态）
+if [ -n "${SCHEDULE_TABLE_ID:-}" ]; then
+  echo "[push] 同步本周行程..."
+  bash "$SKILL_DIR/scripts/sync_schedule.sh" append || echo "[push] 行程同步出错，继续"
+fi
+
+# 3) 拉今日日程（从日历实时读，最准）
+TODAY_YMD=$(date '+%Y-%m-%d')
+lark-cli calendar +agenda --as user \
+  --start "${TODAY_YMD}T00:00:00+08:00" --end "${TODAY_YMD}T23:59:59+08:00" \
+  --format json 2>/dev/null > /tmp/tasktracker_sched_$$.json || echo '{}' > /tmp/tasktracker_sched_$$.json
+SCHED_CNT=$(jq -r '(.data // []) | length' /tmp/tasktracker_sched_$$.json 2>/dev/null || echo 0)
+SCHED_TXT=$(jq -r '
+  (.data // [])
+  | sort_by(.start_time.datetime)
+  | map("• " + (.start_time.datetime|split("T")[1][0:5]) + " " + (.summary // "(无主题)") + (if .vchat.meeting_url then " 🎥" else "" end))
+  | .[]
+' /tmp/tasktracker_sched_$$.json 2>/dev/null) || SCHED_TXT=""
+rm -f /tmp/tasktracker_sched_$$.json
+
+# 4) 读取未完成任务：状态 = 待办 或 进行中（select 字段用 intersects + 数组）
 echo "[push] 读取未完成任务..."
-# 拉未完成任务：状态 = 待办 或 进行中（select 字段用 intersects + 数组）
 lark-cli base +record-list \
   --base-token "$BASE_TOKEN" --table-id "$TABLE_ID" \
   --filter-json '{"logic":"and","conditions":[["状态","intersects",["待办","进行中"]]]}' \
@@ -23,7 +43,6 @@ lark-cli base +record-list \
 RECJSON="/tmp/tasktracker_open_$$.json"
 COUNT=$(jq -r '.data.record_id_list | length' "$RECJSON" 2>/dev/null || echo "0")
 
-# 列式→清单文本：.data.fields 是列名，.data.data 是行数组
 LIST=$(jq -r '
   .data.fields as $cols
   | (.data.data // [])
@@ -42,13 +61,20 @@ LIST=$(jq -r '
 DATE_CN=$(date '+%m月%d日')
 WEEKDAY=$(date '+%u'); WD_CN=(周一 周二 周三 周四 周五 周六 周日); WEEK="${WD_CN[$((WEEKDAY-1))]}"
 
-if [ "$COUNT" = "0" ] || [ -z "$LIST" ]; then
-  MSG="☀️ 早上好，${MY_NAME}！\n\n📋 **${DATE_CN} ${WEEK} 任务清单**\n\n目前没有待办任务，清清爽爽～\n\n📊 查看完整表格: ${BASE_URL}"
+# 日程板块
+if [ "${SCHED_CNT:-0}" -gt 0 ] && [ -n "${SCHED_TXT:-}" ]; then
+  SCHED_BLOCK="📅 **今日日程**（${SCHED_CNT} 场）\n${SCHED_TXT}\n\n"
 else
-  MSG="☀️ 早上好，${MY_NAME}！\n\n📋 **${DATE_CN} ${WEEK} 任务清单**（共 ${COUNT} 项待办）\n\n${LIST}\n\n📊 打开表格勾选/管理: ${BASE_URL}"
+  SCHED_BLOCK="📅 **今日日程**：今天没排日程，清清爽爽 🌞\n\n"
 fi
 
-echo "[push] 发送清单（$COUNT 项）..."
+if [ "$COUNT" = "0" ] || [ -z "$LIST" ]; then
+  MSG="☀️ 早上好，${MY_NAME}！\n\n📆 **${DATE_CN} ${WEEK}**\n\n${SCHED_BLOCK}📋 待办：目前没有待办任务，清清爽爽～\n\n📊 本周行程表 & 任务: ${BASE_URL}"
+else
+  MSG="☀️ 早上好，${MY_NAME}！\n\n📆 **${DATE_CN} ${WEEK}**\n\n${SCHED_BLOCK}📋 **待办清单**（共 ${COUNT} 项）\n\n${LIST}\n\n📊 本周行程表 & 任务: ${BASE_URL}"
+fi
+
+echo "[push] 发送清单（日程 $SCHED_CNT 场 · 待办 $COUNT 项）..."
 printf '%b' "$MSG" > /tmp/tasktracker_push_$$.txt
 lark-cli im +messages-send \
   --user-id "$MY_OPEN_ID" \

@@ -22,8 +22,9 @@ metadata:
    - 通知/汇报/闭环/寒暄 → 丢
    - 模棱两可 → 留，标题前加 `❓` 标记待确认
 3. **去重入表**：按 `message_id` 去重，只把新消息写进多维表格（状态默认「待办」）
-4. **每晚总结**（晚上跑）：扫全天 → 推送当日任务日报（今日新增 + 待办/进行中/已完成总览）
-5. **每早清单**（早上跑）：扫最新 → 推送今天的待办清单私信，我打开表格就能勾选管理
+4. **每晚总结**（晚上跑）：扫全天 → 推送当日任务日报 + **明日日程预览**
+5. **每早清单**（早上跑）：扫最新 → 推送**今日日程** + 今天的待办清单私信，我打开表格就能勾选管理
+6. **本周行程表**（可选）：把飞书日历**本周（周一~周日）的日程**同步成一张多维表格，一行一个日程，可标记已完成/未完成；每周一全量刷新，新约的会每天追加进去
 
 数据全部落在一张**多维表格**里，随时打开即可看到每天哪些完成、哪些没完成。
 
@@ -81,10 +82,13 @@ bash scripts/evening_summary.sh # 扫 + 推晚间日报
 
 ### 5. 定时（cron）
 
-在 OpenClaw 里用 `cron` 工具挂两个 isolated agentTurn 任务（或直接系统 crontab）：
+在 OpenClaw 里用 `cron` 工具挂 isolated agentTurn 任务（或直接系统 crontab）：
 
-- **每晚 22:00**：`bash ~/.agents/skills/lark-task-tracker/scripts/evening_summary.sh`
-- **每早 08:30**：`bash ~/.agents/skills/lark-task-tracker/scripts/push_tasks.sh`
+- **每晚 22:00**：`bash ~/.agents/skills/lark-task-tracker/scripts/evening_summary.sh`（日报 + 明日日程预览）
+- **每早 08:30**：`bash ~/.agents/skills/lark-task-tracker/scripts/push_tasks.sh`（今日日程 + 待办清单）
+- **每周一 00:05**（启用行程表时）：`bash ~/.agents/skills/lark-task-tracker/scripts/sync_schedule.sh refresh`（全量刷新本周行程）
+
+> 早/晚两个脚本已内置 `sync_schedule.sh append`，日常新约的会会自动追加进行程表，无需单独挂 append 任务。
 
 ## 脚本
 
@@ -92,8 +96,9 @@ bash scripts/evening_summary.sh # 扫 + 推晚间日报
 |------|------|
 | [`scripts/scan.sh`](scripts/scan.sh) | 扫描近 N 天 @我的/我承诺的，AI 筛选后去重写入多维表格 |
 | [`scripts/ai_filter.sh`](scripts/ai_filter.sh) | MiniMax M3 二次筛选（分块处理），判断是否真任务+提炼标题+识别截止 |
-| [`scripts/push_tasks.sh`](scripts/push_tasks.sh) | 先扫最新，再把未完成任务整理成清单私信推给本人（早间） |
-| [`scripts/evening_summary.sh`](scripts/evening_summary.sh) | 先扫全天，再推送当日任务日报（晚间） |
+| [`scripts/push_tasks.sh`](scripts/push_tasks.sh) | 早间：先扫最新+同步行程，再把**今日日程**+未完成任务推给本人 |
+| [`scripts/evening_summary.sh`](scripts/evening_summary.sh) | 晚间：先扫全天+同步行程，再推当日任务日报+**明日日程预览** |
+| [`scripts/sync_schedule.sh`](scripts/sync_schedule.sh) | 同步本周行程到多维表格：`refresh`全量刷新（周一用）/`append`增量追加（日常用，保留已改状态） |
 
 ## 关键实现要点（给维护者）
 
@@ -132,6 +137,53 @@ bash scripts/evening_summary.sh # 扫 + 推晚间日报
 - **为什么用白名单而不是读字段选项**：飞书 select 字段写入未知值时会**自动新建选项**，如果直接拿字段选项做校验，M3 自创的项目会被 Feishu 自动落地，造成项目增生。用 config 里固定的白名单才能真正挡住。
 - **新增项目时**：把名字加到 `PROJECT_WHITELIST`（同时建议在项目总表加一行），下次 scan 就能自动归入
 - 实测：41/41 任务 100% 自动归档，字段保持 11 选项无增生
+
+## 本周行程表（日历同步）
+
+把你飞书日历**本周（周一~周日）的日程**同步成一张多维表格，一眼看全一周安排，可勾完成/未完成。与任务表**分开**（任务是要勾掉的待办，日程是到点就过期的时间块，生命周期不同）。
+
+### 建表（首次）
+
+在任务表同一个 base 里新建一张：
+
+```bash
+lark-cli base +table-create \
+  --base-token "$BASE_TOKEN" \
+  --name "本周行程" \
+  --fields '[
+    {"name":"日程主题","type":"text"},
+    {"name":"日期","type":"date"},
+    {"name":"星期","type":"select","multiple":false,"options":[{"name":"周一"},{"name":"周二"},{"name":"周三"},{"name":"周四"},{"name":"周五"},{"name":"周六"},{"name":"周日"}]},
+    {"name":"时间","type":"text"},
+    {"name":"类型","type":"select","multiple":false,"options":[{"name":"面试"},{"name":"需求沟通"},{"name":"会议"},{"name":"内部"},{"name":"其他"}]},
+    {"name":"状态","type":"select","multiple":false,"options":[{"name":"待办"},{"name":"已完成"},{"name":"已取消"}]},
+    {"name":"视频","type":"checkbox"},
+    {"name":"日程链接","type":"text"},
+    {"name":"event_id","type":"text"}
+  ]' --as user
+```
+
+把返回的 table_id 填进 `config.env` 的 `SCHEDULE_TABLE_ID`。
+
+### 两种同步模式
+
+```bash
+bash scripts/sync_schedule.sh refresh   # 全量刷新：清空表重拉本周全部（周一换周用）
+bash scripts/sync_schedule.sh append    # 增量：只加表里没的 event_id，已有行原样保留（日常用）
+```
+
+- **refresh**：清空重灌，状态回到「待办」。每周一凌晨跑一次，换到新的一周。
+- **append**：按 `event_id` 去重，只把新约的会追加进去，**不覛盖你手动改的「已完成」**。早/晚推送都会顺手跑 append。
+
+### 关键实现要点（给维护者）
+
+- **拉本周日程**：`lark-cli calendar +agenda --as user --start <周一>T00:00:00+08:00 --end <周日>T23:59:59+08:00`（`+agenda` 支持 `--start/--end` 时间范围，一次拉多天）
+- **周边界**：用 `date -d "$TODAY -$((DOW-1)) days"` 算本周一（`date -d 'monday this week'` 在部分系统会指向下周一，不可靠）
+- **event_id 去重**：表里存 `event_id`（形如 `xxx_1782702000`），append 时读现有 event_id，`grep -qxF` 判重
+- **⚙ record-list 上限 200**：`--limit` 范围 1-200，**写 500 会静默返回空**（踩过坑），列表/去重一律用 `--limit 200`
+- **删除用 `+record-delete`**（非 batch）：可重复 `--record-id`，high-risk 需 `--yes`
+- **datetime 写入**：日期字段写 `YYYY-MM-DD 00:00:00` 字符串（当天零点）
+- **类型自动分类**：按标题关键词粗分（面试/需求沟通/会议/内部/其他），可在 `sync_schedule.sh` 的 `classify()` 里调
 
 ## 项目化结构（方向 A 产出）
 - **任务表**加「所属项目」单选字段 + 「按项目分组」视图（group by 所属项目）
